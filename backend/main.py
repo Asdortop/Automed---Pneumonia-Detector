@@ -29,7 +29,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from classifier import build_model
 from gradcam    import GradCAM, analyze_image
-from rag        import run_full_pipeline, load_index
+import report
 
 # ─────────────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -48,47 +48,49 @@ app.add_middleware(
 
 # ── Global model state (loaded once at startup) ───────────────────────────────
 DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-MODEL      = None
-GRADCAM    = None
-FAISS_DATA = None   # (index, encoder, chunks)
+MODEL   = None
+GRADCAM = None
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @app.on_event("startup")
 async def load_models():
-    """Load all models once when the server starts."""
-    global MODEL, GRADCAM, FAISS_DATA
+    """Load classifier + Grad-CAM once when the server starts."""
+    global MODEL, GRADCAM
 
-    base_dir   = Path(__file__).resolve().parent.parent
-    ckpt_path  = base_dir / "models" / "classifier.pth"
-    index_path = base_dir / "data"   / "faiss_index.pkl"
+    base_dir  = Path(__file__).resolve().parent.parent
+    ckpt_path = base_dir / "models" / "classifier.pth"
 
     if not ckpt_path.exists():
         print(f"⚠️  No classifier checkpoint at {ckpt_path}. Train first.")
         return
-    if not index_path.exists():
-        print(f"⚠️  No FAISS index at {index_path}. Run: python src/rag.py --build_index")
-        return
 
     print(f"  Loading model on {DEVICE}...")
-    MODEL   = build_model(DEVICE)
-    ckpt    = torch.load(ckpt_path, map_location=DEVICE)
+    MODEL = build_model(DEVICE)
+    ckpt  = torch.load(ckpt_path, map_location=DEVICE)
     MODEL.load_state_dict(ckpt["model_state_dict"])
     MODEL.eval()
 
-    GRADCAM    = GradCAM(MODEL, DEVICE)
-    FAISS_DATA = load_index()
-    print("✅  AutoMed models loaded and ready.")
+    GRADCAM = GradCAM(MODEL, DEVICE)
+    print("✅  AutoMed model loaded and ready.")
+
+    # FAISS index is optional — report.py handles it gracefully if missing
+    index_path = base_dir / "data" / "faiss_index.pkl"
+    if index_path.exists():
+        print("✅  FAISS index found — RAG fallback available.")
+    else:
+        print("ℹ️  No FAISS index — using simple template reports (run src/rag.py --build_index to enable RAG).")
 
 
 @app.get("/health")
 async def health():
     """Quick health check."""
+    index_path = Path(__file__).resolve().parent.parent / "data" / "faiss_index.pkl"
     return {
-        "status":  "ok",
-        "device":  str(DEVICE),
-        "model":   "loaded" if MODEL else "not loaded",
-        "faiss":   "loaded" if FAISS_DATA else "not loaded",
+        "status": "ok",
+        "device": str(DEVICE),
+        "model":  "loaded" if MODEL else "not loaded",
+        "faiss":  "available" if index_path.exists() else "not built",
     }
 
 
@@ -105,7 +107,7 @@ async def analyze(file: UploadFile = File(...)):
     if MODEL is None or GRADCAM is None:
         raise HTTPException(
             status_code=503,
-            detail="Models not loaded. Train the classifier and build FAISS index first."
+            detail="Model not loaded. Run: python src/train_classifier.py first."
         )
 
     # ── Validate file type ────────────────────────────────────────────────
@@ -132,12 +134,16 @@ async def analyze(file: UploadFile = File(...)):
             device=DEVICE,
         )
 
-        # ── Run RAG report generation ─────────────────────────────────────
-        api_key = os.environ.get("GROQ_API_KEY", "")
-        index, encoder, chunks = FAISS_DATA
-        from rag import retrieve, generate_report
-        retrieved = retrieve(result["query"], index, encoder, chunks, top_k=3)
-        report    = generate_report(result["query"], retrieved, api_key)
+        # ── Generate report (simple template first, RAG if available) ─────
+        api_key     = os.environ.get("GROQ_API_KEY", "")
+        report_text = report.generate(
+            label       = result["label"],
+            probability = result["probability"],
+            location    = result["location"],
+            severity    = result["severity"],
+            query       = result["query"],
+            api_key     = api_key,
+        )
 
         # ── Encode heatmap overlay to base64 for JSON transport ───────────
         overlay_pil    = Image.fromarray(result["overlay"])
@@ -151,7 +157,7 @@ async def analyze(file: UploadFile = File(...)):
             "location":     result["location"],
             "severity":     result["severity"],
             "query":        result["query"],
-            "report":       report,
+            "report":       report_text,
             "heatmap_b64":  heatmap_b64,
         })
 
